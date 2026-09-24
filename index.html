@@ -151,7 +151,7 @@
   </div>
 </div>
 
-<div id="game-wrap">
+<div id="game-wrap" style="display:none">
   <canvas id="game-canvas" width="800" height="600"></canvas>
   <div id="ui">
     <div class="panel">
@@ -199,7 +199,6 @@ const CONFIG = {
 };
 
 // Path: defined as a series of waypoints (in tile coords)
-// Goes from left edge, snakes down to bottom-right exit
 const PATH = [
   {x: 0,  y: 2}, {x: 6,  y: 2}, {x: 6,  y: 6},
   {x: 14, y: 6}, {x: 14, y: 1}, {x: 18, y: 1},
@@ -208,7 +207,6 @@ const PATH = [
   {x: 17, y: 14},
 ];
 
-// Tower definitions
 const TOWER_TYPES = {
   archer: {
     name: '🏹 弓箭塔',
@@ -231,7 +229,7 @@ const TOWER_TYPES = {
   frost: {
     name: '❄ 冰霜塔',
     cost: 70,
-    desc: '减速敌人，搭配输出塔',
+    desc: '减速敌人，搭配输出',
     color: '#88ddff',
     damage: 8, range: 3.0, fireRate: 1100,
     projectile: 'frost', projSpeed: 10,
@@ -248,50 +246,38 @@ const TOWER_TYPES = {
   },
 };
 
-// Enemy definitions per wave (spawned in order)
 function getWaveEnemies(waveNum) {
   const waves = [
-    // Wave 1: 6 grunts
     () => [{type:'grunt', count:6, gap:600}],
-    // Wave 2: 10 grunts
     () => [{type:'grunt', count:10, gap:500}],
-    // Wave 3: mixed with runners
     () => [
       {type:'grunt', count:6, gap:600},
       {type:'runner', count:6, gap:350},
     ],
-    // Wave 4: tanks appear
     () => [
       {type:'grunt', count:8, gap:500},
       {type:'tank', count:2, gap:1500},
     ],
-    // Wave 5: boss-like swarm
     () => [
       {type:'runner', count:12, gap:300},
       {type:'tank', count:3, gap:1200},
     ],
-    // Wave 6: mixed heavy
     () => [
       {type:'grunt', count:10, gap:400},
       {type:'tank', count:4, gap:1000},
       {type:'runner', count:6, gap:300},
     ],
-    // Wave 7: flying enemies (can't be hit by some)
     () => [
       {type:'flying', count:8, gap:600},
       {type:'grunt', count:8, gap:500},
     ],
-    // Wave 8: tank rush
     () => [{type:'tank', count:8, gap:900}],
-    // Wave 9: mixed chaos
     () => [
       {type:'runner', count:15, gap:250},
       {type:'flying', count:6, gap:700},
       {type:'tank', count:3, gap:1100},
     ],
-    // Wave 10: mid boss
     () => [{type:'boss', count:1, gap:1}],
-    // Wave 11-15: scaling difficulty
     () => [{type:'grunt', count:20, gap:300}, {type:'tank', count:5, gap:800}],
     () => [{type:'runner', count:25, gap:200}, {type:'flying', count:8, gap:500}],
     () => [{type:'tank', count:12, gap:700}, {type:'flying', count:10, gap:500}],
@@ -325,14 +311,31 @@ const state = {
   selectedTower: null,
   waveInProgress: false,
   spawnQueue: [],
-  spawnTimer: 0,
+  spawnElapsed: 0,        // 累计经过的时间(ms)，spawnAt 增量计算
+  spawnNextAt: 0,         // 下一个敌人出生时间点
   hoverCell: null,
   gameOver: false,
   paused: false,
+  kills: 0,
+  uiNeedsUpdate: true,    // 脏标记：UI 只在变化时更新
 };
 
 const canvas = document.getElementById('game-canvas');
 const ctx = canvas.getContext('2d');
+
+// 缓存 DOM 引用 (性能优化)
+const ui = {
+  gold: document.getElementById('gold'),
+  lives: document.getElementById('lives'),
+  wave: document.getElementById('wave'),
+  enemies: document.getElementById('enemies'),
+  towerList: document.getElementById('tower-list'),
+  selectedPanel: document.getElementById('selected-panel'),
+  selectedInfo: document.getElementById('selected-info'),
+  upgradeBtn: document.getElementById('upgrade-btn'),
+  startWaveBtn: document.getElementById('start-wave-btn'),
+  log: document.getElementById('log'),
+};
 
 // ============================================================
 // PATH COMPUTATION
@@ -353,7 +356,6 @@ const PATH_SEGS = buildPathSegments();
 const TOTAL_PATH_LEN = PATH_SEGS.reduce((s, seg) => s + seg.len, 0);
 
 function distAlongPath(progress) {
-  // progress is 0..1 of total path
   const target = progress * TOTAL_PATH_LEN;
   let acc = 0;
   for (const seg of PATH_SEGS) {
@@ -368,7 +370,6 @@ function distAlongPath(progress) {
 }
 
 function isPathTile(col, row) {
-  // Check if tile is on path: tile center on path within half tile
   const cx = col * CONFIG.TILE + CONFIG.TILE/2;
   const cy = row * CONFIG.TILE + CONFIG.TILE/2;
   for (const seg of PATH_SEGS) {
@@ -391,7 +392,8 @@ class Enemy {
     this.type = type;
     this.maxHp = def.hp * (1 + waveBonus * 0.15);
     this.hp = this.maxHp;
-    this.baseSpeed = def.speed * CONFIG.TILE / 60; // tiles/sec -> px/frame at 60fps
+    // speed: 每秒移动的像素数(像素/秒)
+    this.baseSpeed = def.speed * CONFIG.TILE;
     this.speed = this.baseSpeed;
     this.gold = Math.floor(def.gold * (1 + waveBonus * 0.1));
     this.color = def.color;
@@ -399,29 +401,40 @@ class Enemy {
     this.flying = def.flying;
     this.armor = def.armor || 0;
     this.slowTimer = 0;
-    this.progress = 0; // 0..1 along path
+    this.progress = 0;
     this.dead = false;
     this.reachedEnd = false;
+    this.x = 0;
+    this.y = 0;
+    // 初始位置
+    const p0 = distAlongPath(0);
+    this.x = p0.x;
+    this.y = p0.y;
   }
   update(dt) {
-    // slow effect decays
     if (this.slowTimer > 0) {
       this.slowTimer -= dt;
       if (this.slowTimer <= 0) this.speed = this.baseSpeed;
     }
-    const movePx = this.speed * dt * 60; // dt in seconds
+    const movePx = this.speed * dt;
     this.progress += movePx / TOTAL_PATH_LEN;
-    if (this.progress >= 1) {
+    if (this.progress >= 1 && !this.reachedEnd) {
       this.reachedEnd = true;
       state.lives -= 1;
       log(`💥 敌人抵达终点！ -1 生命`, 'bad');
-      if (state.lives <= 0) endGame(false);
+      if (state.lives <= 0) {
+        state.lives = 0;
+        endGame(false);
+      }
     }
   }
   draw(ctx) {
-    const pos = distAlongPath(this.progress);
-    this.x = pos.x; this.y = pos.y;
-    // shadow (only for ground)
+    // 使用缓存的位置避免每帧重复计算
+    const barW = this.size * 1.6;
+    const barH = 4;
+    const bx = this.x - barW/2;
+    const by = this.y - this.size - 8;
+    // shadow
     if (!this.flying) {
       ctx.fillStyle = 'rgba(0,0,0,0.3)';
       ctx.beginPath();
@@ -432,7 +445,6 @@ class Enemy {
     ctx.fillStyle = this.color;
     ctx.beginPath();
     if (this.flying) {
-      // diamond shape
       ctx.moveTo(this.x, this.y - this.size);
       ctx.lineTo(this.x + this.size, this.y);
       ctx.lineTo(this.x, this.y + this.size);
@@ -441,15 +453,10 @@ class Enemy {
       ctx.arc(this.x, this.y - this.size/3, this.size, 0, Math.PI*2);
     }
     ctx.fill();
-    // outline
     ctx.strokeStyle = '#000';
     ctx.lineWidth = 1.5;
     ctx.stroke();
     // hp bar
-    const barW = this.size * 1.6;
-    const barH = 4;
-    const bx = this.x - barW/2;
-    const by = this.y - this.size - 8;
     ctx.fillStyle = '#400';
     ctx.fillRect(bx, by, barW, barH);
     const hpRatio = Math.max(0, this.hp / this.maxHp);
@@ -467,24 +474,27 @@ class Enemy {
     }
   }
   takeDamage(dmg) {
-    // armor reduces damage by %
     const real = dmg * (1 - this.armor);
     this.hp -= real;
     spawnDamageNumber(this.x, this.y - this.size, Math.round(real));
     if (this.hp <= 0 && !this.dead) {
       this.dead = true;
       state.gold += this.gold;
+      state.kills++;
       log(`✅ 击杀 ${this.type} +${this.gold} 金币`, 'good');
-      updateUI();
     }
   }
   applySlow(amount, duration) {
-    // strongest slow wins, refresh duration
     const newSpeed = this.baseSpeed * (1 - amount);
     if (this.speed > newSpeed) {
       this.speed = newSpeed;
     }
     this.slowTimer = Math.max(this.slowTimer, duration);
+  }
+  syncPosition() {
+    const pos = distAlongPath(this.progress);
+    this.x = pos.x;
+    this.y = pos.y;
   }
 }
 
@@ -504,7 +514,6 @@ class Tower {
     this.totalInvested = def.cost;
     this.target = null;
     this.angle = 0;
-    // mutable stats (scaled by level)
     this.damage = def.damage;
     this.range = def.range;
     this.fireRate = def.fireRate;
@@ -530,66 +539,79 @@ class Tower {
     this.range = this.def.range + (this.level-1) * 0.4;
     this.fireRate = this.def.fireRate * Math.pow(0.85, this.level-1);
     log(`⬆ ${this.def.name} 升级到 Lv.${this.level}`, 'good');
-    updateUI();
     return true;
   }
+  // FIX #3: 找目标时严格排除 dead/reachedEnd 敌人
   findTarget() {
-    // pick enemy furthest along path within range
     let best = null;
     let bestProgress = -1;
     const rangePx = this.range * CONFIG.TILE;
-    for (const e of state.enemies) {
-      if (e.dead || e.reachedEnd) continue;
-      const dist = Math.hypot(e.x - this.x, e.y - this.y);
-      if (dist <= rangePx && e.progress > bestProgress) {
+    const enemies = state.enemies;
+    for (let i = 0, n = enemies.length; i < n; i++) {
+      const e = enemies[i];
+      // FIX: 跳过无效目标
+      if (!e || e.dead || e.reachedEnd) continue;
+      const dx = e.x - this.x;
+      const dy = e.y - this.y;
+      const dist2 = dx*dx + dy*dy;
+      const range2 = rangePx * rangePx;
+      if (dist2 <= range2 && e.progress > bestProgress) {
         best = e;
         bestProgress = e.progress;
       }
     }
     return best;
   }
+  // FIX #3: 验证目标是否仍然有效
+  isTargetValid() {
+    const t = this.target;
+    return t && !t.dead && !t.reachedEnd;
+  }
   update(dt) {
     this.cooldown -= dt * 1000;
-    if (!this.target || this.target.dead || this.target.reachedEnd) {
+    // FIX: 先检查目标有效性，无效则重新找
+    if (!this.isTargetValid()) {
       this.target = this.findTarget();
-    } else {
-      const rangePx = this.range * CONFIG.TILE;
-      if (Math.hypot(this.target.x - this.x, this.target.y - this.y) > rangePx) {
-        this.target = this.findTarget();
-      }
     }
     if (this.target) {
-      // aim
       const dx = this.target.x - this.x;
       const dy = this.target.y - this.y;
       this.angle = Math.atan2(dy, dx);
       if (this.cooldown <= 0) {
-        this.fire();
-        this.cooldown = this.fireRate;
+        // FIX #3: 再次确认目标活着再 fire，避免无效射击
+        if (this.isTargetValid()) {
+          this.fire();
+          this.cooldown = this.fireRate;
+        } else {
+          this.target = null;
+        }
       }
     }
   }
   fire() {
     const t = this.target;
     if (this.type === 'lightning') {
-      // instant chain
       this.lightning(t);
     } else {
       state.projectiles.push(new Projectile(this, t));
     }
   }
   lightning(firstTarget) {
+    if (!firstTarget || firstTarget.dead || firstTarget.reachedEnd) return;
     const hit = new Set([firstTarget]);
     let dmg = this.damage;
     firstTarget.takeDamage(dmg);
     let lastTarget = firstTarget;
-    for (let i = 1; i < this.chain && state.enemies.length > 0; i++) {
-      // find nearest other enemy to lastTarget within range
+    for (let i = 1; i < this.chain; i++) {
       let next = null;
       let bestDist = this.range * CONFIG.TILE;
-      for (const e of state.enemies) {
-        if (hit.has(e) || e.dead || e.reachedEnd) continue;
-        const d = Math.hypot(e.x - lastTarget.x, e.y - lastTarget.y);
+      const enemies = state.enemies;
+      for (let j = 0, n = enemies.length; j < n; j++) {
+        const e = enemies[j];
+        if (hit.has(e) || !e || e.dead || e.reachedEnd) continue;
+        const dx = e.x - lastTarget.x;
+        const dy = e.y - lastTarget.y;
+        const d = Math.hypot(dx, dy);
         if (d < bestDist) {
           bestDist = d;
           next = e;
@@ -605,7 +627,6 @@ class Tower {
     spawnLightningBolt(this.x, this.y, firstTarget.x, firstTarget.y);
   }
   draw(ctx) {
-    // base
     ctx.fillStyle = this.def.color;
     ctx.beginPath();
     ctx.arc(this.x, this.y, 14, 0, Math.PI*2);
@@ -613,20 +634,17 @@ class Tower {
     ctx.strokeStyle = '#000';
     ctx.lineWidth = 2;
     ctx.stroke();
-    // level pips
     ctx.fillStyle = '#fff';
     ctx.font = 'bold 11px sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(this.level, this.x, this.y);
-    // turret (direction indicator)
     ctx.strokeStyle = this.def.color;
     ctx.lineWidth = 3;
     ctx.beginPath();
     ctx.moveTo(this.x, this.y);
     ctx.lineTo(this.x + Math.cos(this.angle) * 18, this.y + Math.sin(this.angle) * 18);
     ctx.stroke();
-    // range if selected
     if (state.selectedTower === this) {
       ctx.strokeStyle = 'rgba(255,215,0,0.5)';
       ctx.lineWidth = 2;
@@ -646,35 +664,41 @@ class Projectile {
     this.y = tower.y;
     this.tower = tower;
     this.target = target;
-    this.speed = tower.projSpeed;
+    this.speed = tower.projSpeed; // 像素/帧 (基于 60fps)
     this.damage = tower.damage;
     this.splash = tower.splash;
     this.slow = tower.slow;
-    this.color = tower.def.color;
     this.type = tower.def.projectile;
+    this.color = tower.def.color;
     this.dead = false;
-    // lead targeting: predict target position
-    if (target) {
+    this.vx = 0;
+    this.vy = 0;
+    // FIX #2: 构造时若目标无效，立即标记死亡
+    if (!target || target.dead || target.reachedEnd) {
+      this.dead = true;
+    } else {
       const dx = target.x - this.x;
       const dy = target.y - this.y;
-      const dist = Math.hypot(dx, dy);
-      const travel = dist / this.speed;
-      this.tx = target.x + (target.x - tower.x) * 0; // simple homing
-      this.ty = target.y;
+      const dist = Math.hypot(dx, dy) || 1;
       this.vx = (dx / dist) * this.speed;
       this.vy = (dy / dist) * this.speed;
     }
   }
   update(dt) {
+    // FIX: 失效目标立即作废
+    if (this.dead) return;
     if (!this.target || this.target.dead || this.target.reachedEnd) {
       this.dead = true;
       return;
     }
-    // simple homing: re-aim each frame
+    // FIX: 单位换算正确 — speed 是"每帧像素"，dt 单位是秒
+    // 每帧 step 数 = dt * 60，所以每帧位移 = speed
+    // 用 speed * dt * 60 表达也行，但用 stepPx = speed (即每帧的位移)
+    const stepPx = this.speed * dt * 60;
     const dx = this.target.x - this.x;
     const dy = this.target.y - this.y;
     const dist = Math.hypot(dx, dy);
-    if (dist < this.speed * dt * 60 + 4) {
+    if (dist <= stepPx + 2) {
       this.hit();
       this.dead = true;
       return;
@@ -685,33 +709,38 @@ class Projectile {
     this.y += this.vy * dt * 60;
   }
   hit() {
+    if (!this.target) return;
+    const t = this.target;
+    if (t.dead || t.reachedEnd) return;
     if (this.type === 'frost') {
-      this.target.applySlow(this.slow, 1500);
-      this.target.takeDamage(this.damage);
+      t.applySlow(this.slow, 1500);
+      t.takeDamage(this.damage);
     } else if (this.splash > 0) {
-      // AOE damage
+      const splashPx = this.splash * CONFIG.TILE;
       for (const e of state.enemies) {
-        if (e.dead || e.reachedEnd) continue;
-        const d = Math.hypot(e.x - this.target.x, e.y - this.target.y);
-        if (d <= this.splash * CONFIG.TILE) {
-          const falloff = 1 - (d / (this.splash * CONFIG.TILE)) * 0.5;
+        if (!e || e.dead || e.reachedEnd) continue;
+        const dx = e.x - t.x;
+        const dy = e.y - t.y;
+        const d = Math.hypot(dx, dy);
+        if (d <= splashPx) {
+          const falloff = 1 - (d / splashPx) * 0.5;
           e.takeDamage(this.damage * falloff);
         }
       }
-      // explosion particle
       for (let i = 0; i < 8; i++) {
         const ang = (Math.PI * 2 / 8) * i;
         state.particles.push({
-          x: this.target.x, y: this.target.y,
+          x: t.x, y: t.y,
           vx: Math.cos(ang) * 3, vy: Math.sin(ang) * 3,
           life: 400, maxLife: 400, color: '#ffaa44', size: 4,
         });
       }
     } else {
-      this.target.takeDamage(this.damage);
+      t.takeDamage(this.damage);
     }
   }
   draw(ctx) {
+    if (this.dead) return;
     if (this.type === 'arrow') {
       ctx.strokeStyle = '#fff8dc';
       ctx.lineWidth = 2;
@@ -732,7 +761,6 @@ class Projectile {
       ctx.beginPath();
       ctx.arc(this.x, this.y, 4, 0, Math.PI*2);
       ctx.fill();
-      // sparkle
       ctx.strokeStyle = 'rgba(255,255,255,0.6)';
       ctx.lineWidth = 1;
       ctx.beginPath();
@@ -781,7 +809,6 @@ function drawParticles(ctx) {
       ctx.shadowBlur = 10;
       ctx.beginPath();
       ctx.moveTo(p.x1, p.y1);
-      // jagged
       const dx = p.x2 - p.x1;
       const dy = p.y2 - p.y1;
       const dist = Math.hypot(dx, dy);
@@ -801,7 +828,6 @@ function drawParticles(ctx) {
       ctx.globalAlpha = 1;
     }
   }
-  // damage numbers
   for (const d of damageNumbers) {
     ctx.fillStyle = `rgba(255,255,255,${d.life/d.maxLife})`;
     ctx.strokeStyle = `rgba(0,0,0,${d.life/d.maxLife})`;
@@ -814,7 +840,7 @@ function drawParticles(ctx) {
 }
 
 // ============================================================
-// WAVE SPAWNING
+// WAVE SPAWNING  (FIX #4: 重构为时间驱动)
 // ============================================================
 function startNextWave() {
   if (state.waveInProgress || state.gameOver) return;
@@ -825,37 +851,44 @@ function startNextWave() {
   state.wave++;
   state.waveInProgress = true;
   state.spawnQueue = [];
+  state.spawnElapsed = 0;
+  state.spawnNextAt = 0;
+
+  // FIX: 展开为单个时间表（毫秒），按时间顺序处理
   const groups = getWaveEnemies(state.wave - 1);
   const waveBonus = Math.floor((state.wave - 1) / 3);
+  let t = 0;
   for (const g of groups) {
     for (let i = 0; i < g.count; i++) {
-      state.spawnQueue.push({type: g.type, spawnAt: state.spawnTimer + i * g.gap, waveBonus});
+      state.spawnQueue.push({type: g.type, spawnAt: t, waveBonus});
+      t += g.gap;
     }
-    state.spawnTimer += g.count * g.gap + 400;
+    t += 400; // 组间停顿
   }
   log(`🌊 第 ${state.wave} 波来袭！`, 'warn');
-  updateUI();
 }
 
 function updateSpawning(dt) {
   if (!state.waveInProgress) return;
-  state.spawnTimer -= dt * 1000;
-  while (state.spawnQueue.length > 0 && state.spawnQueue[0].spawnAt <= 0) {
+  state.spawnElapsed += dt * 1000;
+  // 生成到期的敌人
+  while (state.spawnQueue.length > 0 && state.spawnQueue[0].spawnAt <= state.spawnElapsed) {
     const item = state.spawnQueue.shift();
     state.enemies.push(new Enemy(item.type, item.waveBonus));
   }
-  // Wave complete when no enemies left and queue empty
-  if (state.spawnQueue.length === 0 && state.enemies.every(e => e.dead || e.reachedEnd)) {
+  // FIX #1: 波次完成判定 — 必须真的"打过了一波"
+  // 之前的 bug: enemies.every() 在空数组上返回 true，导致 waveInProgress 被误设为 false
+  if (state.spawnQueue.length === 0 && state.enemies.length === 0) {
     state.waveInProgress = false;
-    state.spawnTimer = 0;
-    // Bonus gold
+    state.spawnElapsed = 0;
     const bonus = 25 + state.wave * 5;
     state.gold += bonus;
     log(`🎉 第 ${state.wave} 波完成！奖励 +${bonus} 金币`, 'good');
     if (state.wave >= state.totalWaves) {
-      setTimeout(() => endGame(true), 800);
+      setTimeout(() => {
+        if (!state.gameOver) endGame(true);
+      }, 800);
     }
-    updateUI();
   }
 }
 
@@ -880,16 +913,14 @@ canvas.addEventListener('click', (e) => {
 });
 
 function handleClick(col, row) {
-  // First, check if clicking an existing tower
+  // 点击已有塔 — 选中
   for (const t of state.towers) {
     if (t.col === col && t.row === row) {
       state.selectedTower = t;
       state.selectedTowerType = null;
-      updateUI();
       return;
     }
   }
-  // Try to build a new tower
   if (!state.selectedTowerType) return;
   if (isPathTile(col, row)) {
     log('❌ 不能在路径上建塔', 'bad');
@@ -908,7 +939,6 @@ function handleClick(col, row) {
   log(`🏗 建造 ${tower.def.name}`, 'good');
   state.selectedTower = tower;
   state.selectedTowerType = null;
-  updateUI();
 }
 
 document.addEventListener('keydown', (e) => {
@@ -919,7 +949,7 @@ document.addEventListener('keydown', (e) => {
   else if (k === '3') selectTowerType('frost');
   else if (k === '4') selectTowerType('lightning');
   else if (k === 'u') upgradeSelected();
-  else if (k === 'escape') { state.selectedTowerType = null; state.selectedTower = null; updateUI(); }
+  else if (k === 'escape') { state.selectedTowerType = null; state.selectedTower = null; }
   else if (k === ' ') { e.preventDefault(); startNextWave(); }
 });
 
@@ -931,7 +961,6 @@ function selectTowerType(type) {
   }
   state.selectedTowerType = type;
   state.selectedTower = null;
-  updateUI();
 }
 
 function upgradeSelected() {
@@ -951,15 +980,13 @@ function sellSelected() {
   state.towers = state.towers.filter(t => t !== state.selectedTower);
   log(`💰 出售获得 ${value} 金币`, 'good');
   state.selectedTower = null;
-  updateUI();
 }
 
 // ============================================================
-// UI
+// UI  (FIX #7: 缓存 DOM 并按需更新)
 // ============================================================
 function buildTowerList() {
-  const list = document.getElementById('tower-list');
-  list.innerHTML = '';
+  ui.towerList.innerHTML = '';
   const keys = ['archer', 'cannon', 'frost', 'lightning'];
   keys.forEach((k, i) => {
     const def = TOWER_TYPES[k];
@@ -973,16 +1000,26 @@ function buildTowerList() {
       <div class="cost">💰 ${def.cost}</div>
     `;
     card.onclick = () => selectTowerType(k);
-    list.appendChild(card);
+    ui.towerList.appendChild(card);
   });
 }
 
+// 缓存上次的 UI 状态，避免无谓 DOM 写入
+let lastUI = { gold: -1, lives: -1, wave: -1, ec: -1, type: null, towerId: -1, towerLevel: -1 };
+
 function updateUI() {
-  document.getElementById('gold').textContent = state.gold;
-  document.getElementById('lives').textContent = state.lives;
-  document.getElementById('wave').textContent = `${state.wave} / ${state.totalWaves}`;
-  document.getElementById('enemies').textContent = state.enemies.filter(e => !e.dead && !e.reachedEnd).length;
-  // tower cards
+  const enemyCount = state.enemies.length;
+
+  // 数值变化才更新 DOM
+  if (state.gold !== lastUI.gold) { ui.gold.textContent = state.gold; lastUI.gold = state.gold; }
+  if (state.lives !== lastUI.lives) { ui.lives.textContent = state.lives; lastUI.lives = state.lives; }
+  if (state.wave !== lastUI.wave) {
+    ui.wave.textContent = `${state.wave} / ${state.totalWaves}`;
+    lastUI.wave = state.wave;
+  }
+  if (enemyCount !== lastUI.ec) { ui.enemies.textContent = enemyCount; lastUI.ec = enemyCount; }
+
+  // tower cards 选中/禁用状态
   for (const k of Object.keys(TOWER_TYPES)) {
     const card = document.getElementById('card-' + k);
     if (!card) continue;
@@ -992,44 +1029,74 @@ function updateUI() {
     if (state.selectedTowerType === k) card.classList.add('selected');
     else card.classList.remove('selected');
   }
-  // selected tower panel
-  const panel = document.getElementById('selected-panel');
+
+  // 选中塔面板
   if (state.selectedTower) {
-    panel.style.display = 'block';
+    ui.selectedPanel.style.display = 'block';
     const t = state.selectedTower;
+    const towerId = state.towers.indexOf(t);
+    if (towerId !== lastUI.towerId || t.level !== lastUI.towerLevel) {
+      const upgradeCost = t.upgradeCost();
+      const sellVal = t.sellValue();
+      ui.selectedInfo.innerHTML = `
+        <div style="font-weight:bold;margin-bottom:4px">${t.def.name} Lv.${t.level}</div>
+        <div style="font-size:12px;color:#aac;line-height:1.5">
+          伤害 ${Math.round(t.damage)} · 射程 ${t.range.toFixed(1)}<br>
+          攻速 ${(1000/t.fireRate).toFixed(2)}/秒
+        </div>
+        <div style="margin-top:6px;font-size:12px">
+          <span style="color:#ffd700">升级: ${upgradeCost} 金币</span><br>
+          <span style="color:#aac">出售: ${sellVal} 金币</span>
+        </div>
+      `;
+      lastUI.towerId = towerId;
+      lastUI.towerLevel = t.level;
+    }
     const upgradeCost = t.upgradeCost();
-    const sellVal = t.sellValue();
-    document.getElementById('selected-info').innerHTML = `
-      <div style="font-weight:bold;margin-bottom:4px">${t.def.name} Lv.${t.level}</div>
-      <div style="font-size:12px;color:#aac;line-height:1.5">
-        伤害 ${Math.round(t.damage)} · 射程 ${t.range.toFixed(1)}<br>
-        攻速 ${(1000/t.fireRate).toFixed(2)}/秒
-      </div>
-      <div style="margin-top:6px;font-size:12px">
-        <span style="color:#ffd700">升级: ${upgradeCost} 金币</span><br>
-        <span style="color:#aac">出售: ${sellVal} 金币</span>
-      </div>
-    `;
-    const ub = document.getElementById('upgrade-btn');
-    ub.disabled = state.gold < upgradeCost || t.level >= 5;
-    ub.textContent = t.level >= 5 ? '已满级' : `升级 (${upgradeCost}金币)`;
+    ui.upgradeBtn.disabled = state.gold < upgradeCost || t.level >= 5;
+    ui.upgradeBtn.textContent = t.level >= 5 ? '已满级' : `升级 (${upgradeCost}金币)`;
   } else {
-    panel.style.display = 'none';
+    if (ui.selectedPanel.style.display !== 'none') {
+      ui.selectedPanel.style.display = 'none';
+    }
+    lastUI.towerId = -1;
   }
-  // start wave button
-  const sw = document.getElementById('start-wave-btn');
-  sw.disabled = state.waveInProgress || state.gameOver;
-  sw.textContent = state.wave >= state.totalWaves ? '✅ 完成' : (state.waveInProgress ? '战斗中...' : `▶ 第 ${state.wave+1} 波`);
+
+  // 开始波次按钮
+  const swDisabled = state.waveInProgress || state.gameOver;
+  if (ui.startWaveBtn.disabled !== swDisabled) {
+    ui.startWaveBtn.disabled = swDisabled;
+  }
+  const newText = state.wave >= state.totalWaves ? '✅ 完成'
+                : state.waveInProgress ? '战斗中...'
+                : `▶ 第 ${state.wave+1} 波`;
+  if (ui.startWaveBtn.textContent !== newText) {
+    ui.startWaveBtn.textContent = newText;
+  }
 }
 
+// FIX #8: 节流日志 (避免高频写入拖慢主循环)
+let logDirty = false;
+let logQueue = [];
 function log(msg, cls = '') {
-  const logEl = document.getElementById('log');
-  const div = document.createElement('div');
-  if (cls) div.className = cls;
-  div.textContent = msg;
-  logEl.appendChild(div);
+  logQueue.push({msg, cls});
+  if (!logDirty) {
+    logDirty = true;
+    requestAnimationFrame(flushLog);
+  }
+}
+function flushLog() {
+  logDirty = false;
+  if (logQueue.length === 0) return;
+  const logEl = ui.log;
+  for (const {msg, cls} of logQueue) {
+    const div = document.createElement('div');
+    if (cls) div.className = cls;
+    div.textContent = msg;
+    logEl.appendChild(div);
+  }
+  logQueue = [];
   logEl.scrollTop = logEl.scrollHeight;
-  // limit log size
   while (logEl.children.length > 50) logEl.removeChild(logEl.firstChild);
 }
 
@@ -1037,7 +1104,6 @@ function log(msg, cls = '') {
 // RENDERING
 // ============================================================
 function drawBackground() {
-  // grass pattern
   for (let r = 0; r < CONFIG.ROWS; r++) {
     for (let c = 0; c < CONFIG.COLS; c++) {
       const x = c * CONFIG.TILE;
@@ -1046,7 +1112,6 @@ function drawBackground() {
       ctx.fillRect(x, y, CONFIG.TILE, CONFIG.TILE);
     }
   }
-  // path
   ctx.strokeStyle = '#8b6f47';
   ctx.lineWidth = CONFIG.TILE * 0.85;
   ctx.lineCap = 'round';
@@ -1060,13 +1125,11 @@ function drawBackground() {
     else ctx.lineTo(px, py);
   }
   ctx.stroke();
-  // path detail
   ctx.strokeStyle = '#a08560';
   ctx.lineWidth = 2;
   ctx.setLineDash([5, 5]);
   ctx.stroke();
   ctx.setLineDash([]);
-  // start and end markers
   const start = PATH[0];
   const end = PATH[PATH.length-1];
   ctx.fillStyle = '#4f4';
@@ -1103,7 +1166,6 @@ function drawBuildHints() {
   ctx.strokeStyle = valid ? '#7fff7f' : '#888';
   ctx.lineWidth = 2;
   ctx.strokeRect(x + 1, y + 1, CONFIG.TILE - 2, CONFIG.TILE - 2);
-  // show range preview
   if (state.selectedTowerType && valid) {
     const def = TOWER_TYPES[state.selectedTowerType];
     const cx = x + CONFIG.TILE/2;
@@ -1120,15 +1182,11 @@ function render() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   drawBackground();
   drawBuildHints();
-  // draw towers
   for (const t of state.towers) t.draw(ctx);
-  // draw enemies
   for (const e of state.enemies) {
     if (!e.dead && !e.reachedEnd) e.draw(ctx);
   }
-  // projectiles
   for (const p of state.projectiles) p.draw(ctx);
-  // particles
   drawParticles(ctx);
 }
 
@@ -1137,19 +1195,35 @@ function render() {
 // ============================================================
 let lastTime = 0;
 function loop(time) {
-  if (state.gameOver) return;
+  if (state.gameOver) {
+    render(); // 保留最后一帧画面
+    return;
+  }
   const dt = Math.min(0.05, (time - lastTime) / 1000);
   lastTime = time;
   if (!state.paused) {
     updateSpawning(dt);
-    for (const e of state.enemies) {
+    // 更新所有敌人
+    for (let i = 0; i < state.enemies.length; i++) {
+      const e = state.enemies[i];
       if (!e.dead && !e.reachedEnd) e.update(dt);
     }
-    state.enemies = state.enemies.filter(e => !e.dead && !e.reachedEnd);
+    // FIX: 同步所有敌人的显示位置(集中计算，避免每帧多次 distAlongPath)
+    for (let i = 0; i < state.enemies.length; i++) {
+      const e = state.enemies[i];
+      if (!e.dead && !e.reachedEnd) e.syncPosition();
+    }
+    // 清理死亡/到达终点的敌人
+    if (state.enemies.some(e => e.dead || e.reachedEnd)) {
+      state.enemies = state.enemies.filter(e => !e.dead && !e.reachedEnd);
+    }
+    // 更新塔
     for (const t of state.towers) t.update(dt);
+    // 更新投射物 (倒序以便安全删除)
     for (let i = state.projectiles.length - 1; i >= 0; i--) {
-      state.projectiles[i].update(dt);
-      if (state.projectiles[i].dead) state.projectiles.splice(i, 1);
+      const p = state.projectiles[i];
+      p.update(dt);
+      if (p.dead) state.projectiles.splice(i, 1);
     }
     updateParticles(dt);
     updateUI();
@@ -1169,12 +1243,13 @@ function startGame() {
 }
 
 function endGame(victory) {
+  if (state.gameOver) return;
   state.gameOver = true;
   const screen = document.getElementById('end-screen');
   document.getElementById('end-title').textContent = victory ? '🏆 胜利！' : '💀 失败';
   document.getElementById('end-stats').innerHTML = `
     坚持波次: ${state.wave} / ${state.totalWaves}<br>
-    击杀敌人: ${state._kills || 0}<br>
+    击杀敌人: ${state.kills}<br>
     建造塔数: ${state.towers.length}
   `;
   screen.classList.remove('hidden');
